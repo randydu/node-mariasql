@@ -58,6 +58,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <inttypes.h>
 
 // For Pre-VS2015
 #include "snprintf.c"
@@ -1055,31 +1056,10 @@ class Client : public Nan::ObjectWrap {
       unsigned long* lengths = mysql_fetch_lengths(cur_result);
       Local<Value> field_value;
       Local<Array> row = Nan::New<Array>(n_fields);
-      // binary field vars
-      unsigned int vlen;
-      unsigned char* buf;
-      uint16_t* new_buf;
 
       on_resultinfo(fields, n_fields);
-
-      for (unsigned int f = 0; f < n_fields; ++f) {
-        if (cur_row[f] == nullptr)
-          field_value = Nan::Null();
-        else if (IS_BINARY(fields[f])) {
-          vlen = lengths[f];
-          buf = (unsigned char*)(cur_row[f]);
-          new_buf = new uint16_t[vlen];
-          for (unsigned long b = 0; b < vlen; ++b)
-            new_buf[b] = buf[b];
-          field_value = Nan::New<String>(new_buf, vlen).ToLocalChecked();
-          delete[] new_buf;
-        } else {
-          field_value =
-            Nan::New<String>(cur_row[f], lengths[f]).ToLocalChecked();
-        }
-
-        row->Set(f, field_value);
-      }
+      
+      processOneRow( cur_row, n_fields, fields, lengths, field_value, row );
 
       Local<Value> argv[1] = {
         row
@@ -1106,11 +1086,6 @@ class Client : public Nan::ObjectWrap {
       Local<Array> row;
       Local<Array> rows;
 
-      // binary field vars
-      unsigned int vlen;
-      unsigned char* buf;
-      uint16_t* new_buf;
-
       if (n_rows <= INT32_MAX)
         rows = Nan::New<Array>(static_cast<int>(n_rows));
       else
@@ -1122,23 +1097,9 @@ class Client : public Nan::ObjectWrap {
         dbrow = mysql_fetch_row(cur_result);
         lengths = mysql_fetch_lengths(cur_result);
         row = Nan::New<Array>(n_fields);
-        for (unsigned int f = 0; f < n_fields; ++f) {
-          if (dbrow[f] == nullptr)
-            field_value = Nan::Null();
-          else if (IS_BINARY(fields[f])) {
-            vlen = lengths[f];
-            buf = (unsigned char*)(dbrow[f]);
-            new_buf = new uint16_t[vlen];
-            for (unsigned long b = 0; b < vlen; ++b)
-              new_buf[b] = buf[b];
-            field_value = Nan::New<String>(new_buf, vlen).ToLocalChecked();
-            delete[] new_buf;
-          } else {
-            field_value =
-              Nan::New<String>(dbrow[f], lengths[f]).ToLocalChecked();
-          }
-          row->Set(f, field_value);
-        }
+
+        processOneRow( dbrow, n_fields, fields, lengths, field_value, row );
+
         rows->Set(i, row);
       }
 
@@ -1146,6 +1107,48 @@ class Client : public Nan::ObjectWrap {
         rows
       };
       onrow->Call(Nan::New<Object>(context), 1, argv);
+    }
+    
+    void processOneRow(MYSQL_ROW dbrow, unsigned int n_fields, MYSQL_FIELD* fields,  
+              unsigned long* lengths, Local<Value>& field_value, Local<Array>& row){
+
+      for (unsigned int f = 0; f < n_fields; ++f) {
+        const MYSQL_FIELD& field = fields[f];
+        const char * pRowVal = dbrow[f];
+        const int len = lengths[f];
+
+        if (pRowVal == nullptr)
+          field_value = Nan::Null();
+        else if (IS_BINARY(field)) {
+          field_value = Nan::NewOneByteString((const uint8_t*)pRowVal, len).ToLocalChecked();
+        } else if(field.type == MYSQL_TYPE_BIT){
+            //MySQL sends BIT value in BIG-ENDIAN!
+            if(len == 1){
+              field_value = Nan::New((uint8_t)pRowVal[0]);
+            }else if(len <= 4){
+              uint32_t v = (uint8_t)pRowVal[0];
+              for(unsigned char j = 1; j < len; j++){
+                v <<= 8;
+                v += (uint8_t)pRowVal[j];
+              }
+              field_value = Nan::New(v);
+            }else if(len <= 8){ //MYSQL supports up to 64 bit width of BIT field
+              uint64_t v = (uint8_t)pRowVal[0];
+              for(unsigned char j = 1; j < len; j++){
+                v <<= 8;
+                v += (uint8_t)pRowVal[j];
+              }
+              //Due to javascript Integer does not support 64 bit, we use string instead
+              char buf[128];
+              sprintf(buf, "%" PRId64, v);
+              field_value = Nan::New<String>(buf).ToLocalChecked();
+            }
+        }else{
+            field_value = Nan::New<String>(pRowVal, len).ToLocalChecked();
+        }
+        
+        row->Set(f, field_value);
+      }
     }
 
     void on_resultinfo(MYSQL_FIELD* fields, unsigned int n_fields) {
@@ -1237,7 +1240,7 @@ class Client : public Nan::ObjectWrap {
       int r;
 
       r = snprintf(u64_buf, sizeof(u64_buf), "%" PRIu64, numRows);
-      if (r <= 0 || r >= sizeof(u64_buf))
+      if (r <= 0 || (size_t)r >= sizeof(u64_buf))
         argv[0] = Nan::EmptyString();
       else
         argv[0] = Nan::New<String>(u64_buf, r).ToLocalChecked();
@@ -1246,14 +1249,14 @@ class Client : public Nan::ObjectWrap {
         argv[1] = Nan::New<String>(neg_one_symbol);
       else {
         r = snprintf(u64_buf, sizeof(u64_buf), "%" PRIu64, affRows);
-        if (r <= 0 || r >= sizeof(u64_buf))
+        if (r <= 0 || (size_t)r >= sizeof(u64_buf))
           argv[1] = Nan::EmptyString();
         else
           argv[1] = Nan::New<String>(u64_buf, r).ToLocalChecked();
       }
 
       r = snprintf(u64_buf, sizeof(u64_buf), "%" PRIu64, insertId);
-      if (r <= 0 || r >= sizeof(u64_buf))
+      if (r <= 0 || (size_t)r >= sizeof(u64_buf))
         argv[2] = Nan::EmptyString();
       else
         argv[2] = Nan::New<String>(u64_buf, r).ToLocalChecked();
@@ -1558,7 +1561,7 @@ class Client : public Nan::ObjectWrap {
       uint64_t insertId = obj->lastInsertId();
 
       int r = snprintf(u64_buf, sizeof(u64_buf), "%" PRIu64, insertId);
-      if (r <= 0 || r >= sizeof(u64_buf))
+      if (r <= 0 || (size_t)r >= sizeof(u64_buf))
         info.GetReturnValue().Set(Nan::EmptyString());
       else {
         info.GetReturnValue().Set(
